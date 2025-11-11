@@ -1,0 +1,6 @@
+work/
+.results/
+.nextflow.log
+results/
+*.swp
+__pycache__/
