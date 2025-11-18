@@ -34,9 +34,10 @@ workflow {
     harmonized    = reheadered      | HARMONIZE_DONOR
     pileups       = harmonized      | PILEUP
     demux_calls   = pileups         | DEMUXLET
-    final_labels  = demux_calls     | QC_INTERSECT
+    qc_labels     = demux_calls     | QC_INTERSECT
+    reports       = qc_labels       | REPORT
 
-    final_labels.view()
+    reports.view()
 }
 
 process NORMALIZE_POP {
@@ -161,11 +162,26 @@ process QC_INTERSECT {
     input:
       tuple val(pool), val(qc_rds), val(outdir), path(demux_best)
     output:
-      path("${pool}_final_labels.tsv")
+      tuple val(pool), val(qc_rds), val(outdir), path(demux_best), path("${pool}_final_labels.tsv")
     script:
     """
     Rscript ${params.qc_intersect_R} ${qc_rds} ${demux_best} ${pool}_final_labels.tsv
     mkdir -p ${outdir}
     cp ${pool}_final_labels.tsv ${outdir}/
+    """
+}
+
+process REPORT {
+    tag { "report_${pool}" }
+    input:
+      tuple val(pool), val(qc_rds), val(outdir), path(demux_best), path(final_labels)
+    output:
+      path("${pool}_summary.tsv"), path("${pool}_summary.png")
+    script:
+    """
+    Rscript ${projectDir}/scripts/report_counts.R \\
+      ${pool} ${qc_rds} ${demux_best} ${final_labels} ${pool}_summary.tsv ${pool}_summary.png
+    mkdir -p ${outdir}
+    cp ${pool}_summary.tsv ${pool}_summary.png ${outdir}/
     """
 }
