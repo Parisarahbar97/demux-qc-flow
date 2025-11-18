@@ -19,14 +19,19 @@ params.demux_script      = params.demux_script      ?: "${projectDir}/scripts/02
 params.qc_intersect_R    = params.qc_intersect_R    ?: "${projectDir}/scripts/qc_intersect.R"
 
 workflow {
-    samples = Channel.fromPath(params.pools_csv)
-      .ifEmpty { error "Missing pools CSV: ${params.pools_csv}" }
-      .splitCsv(header:true)
+    // Resolve pools CSV and fail fast if missing
+    def pools_file = file(params.pools_csv)
+    if( !pools_file.exists() ) error "Pools CSV not found: ${pools_file}"
 
-    pop_norm = NORMALIZE_POP(params.pop_vcf, params.ref_fasta)
+    // Samples channel as tuples
+    samples = Channel.fromPath(pools_file)
+        .splitCsv(header:true)
+        .map { row -> tuple(row.pool, file(row.bam), file(row.barcodes), file(row.donor_vcf), file(row.qc_rds), file(row.outdir)) }
 
-    // attach pop_norm to every sample
-    samples.combine(pop_norm.map{ it }).set { sample_with_pop }
+    // Broadcast pop_vcf/ref to every sample (skip pop normalization; use provided files)
+    def pop_vcf = file(params.pop_vcf)
+    def ref_fa  = file(params.ref_fasta)
+    sample_with_pop = samples.map { s -> tuple(s[0], s[1], s[2], s[3], s[4], s[5], pop_vcf, ref_fa) }
 
     donor_norm    = sample_with_pop | NORMALIZE_DONOR
     intersected   = donor_norm      | INTERSECT_SITES
@@ -38,25 +43,6 @@ workflow {
     reports       = qc_labels       | REPORT
 
     reports.view()
-}
-
-process NORMALIZE_POP {
-    tag "pop"
-    input:
-      val pop_vcf
-      val ref_fasta
-    output:
-      tuple path('pop.norm.bi.snp.maf05.vcf.gz'), val(ref_fasta)
-    script:
-    """
-    bcftools +fixref ${pop_vcf} -- -f ${ref_fasta} -m flip \
-      | bcftools norm -f ${ref_fasta} -m-any \
-      | bcftools view -m2 -M2 -v snps \
-      | bcftools +fill-tags -- -t AC,AN,AF,MAF \
-      | bcftools view -i 'MAF>=0.05' \
-      | bgzip -c > pop.norm.bi.snp.maf05.vcf.gz
-    tabix -f -p vcf pop.norm.bi.snp.maf05.vcf.gz
-    """
 }
 
 process NORMALIZE_DONOR {
@@ -142,7 +128,7 @@ process DEMUXLET {
     script:
     """
     export OMP_NUM_THREADS=40
-    PLP=$(cat ${pileup_prefix_file})
+    PLP=\$(cat ${pileup_prefix_file})
     OUTDIR=${outdir}/demuxlet
     mkdir -p ${OUTDIR}
     /bin/bash ${params.demux_script} \
@@ -176,7 +162,7 @@ process REPORT {
     input:
       tuple val(pool), val(qc_rds), val(outdir), path(demux_best), path(final_labels)
     output:
-      path("${pool}_summary.tsv"), path("${pool}_summary.png")
+      tuple path("${pool}_summary.tsv"), path("${pool}_summary.png")
     script:
     """
     Rscript ${projectDir}/scripts/report_counts.R \\
