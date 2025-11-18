@@ -1,4 +1,4 @@
-Demux + QC Intersection Pipeline (dsl2)
+Demux + QC Intersection Pipeline 
 =======================================
 
 This project runs an end-to-end demultiplexing workflow for all pools, producing high-confidence singlet labels as the intersection of:
