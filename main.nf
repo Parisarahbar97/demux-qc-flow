@@ -26,13 +26,14 @@ workflow {
     // Samples channel as tuples (path objects for files)
     samples = Channel.fromPath(pools_file)
         .splitCsv(header:true)
-        .map { row -> tuple(row.pool, file(row.bam), file(row.barcodes), file(row.donor_vcf), file(row.qc_rds), file(row.outdir)) }
+        .map { row -> tuple(row.pool, file(row.bam), file(row.barcodes), file(row.donor_vcf), file(row.qc_rds), row.outdir) }
 
     // Broadcast pop_vcf/ref to every sample (skip pop normalization; use provided files)
     def pop_vcf = file(params.pop_vcf)
     def pop_vcf_idx = file(params.pop_vcf + ".tbi")
     def ref_fa  = file(params.ref_fasta)
-    sample_with_pop = samples.map { s -> tuple(s[0], s[1], s[2], s[3], s[4], s[5], pop_vcf, pop_vcf_idx, ref_fa) }
+    def ref_fai = file(params.ref_fasta + '.fai')
+    sample_with_pop = samples.map { s -> tuple(s[0], s[1], s[2], s[3], s[4], s[5], pop_vcf, pop_vcf_idx, ref_fa, ref_fai) }
 
     donor_norm    = sample_with_pop | NORMALIZE_DONOR
     intersected   = donor_norm      | INTERSECT_SITES
@@ -49,9 +50,9 @@ workflow {
 process NORMALIZE_DONOR {
     tag { "donor_${pool}" }
     input:
-      tuple val(pool), val(bam), val(barcodes), val(donor_vcf), val(qc_rds), val(outdir), path(pop_vcf), path(pop_vcf_index), path(ref_fasta)
+      tuple val(pool), val(bam), val(barcodes), val(donor_vcf), val(qc_rds), val(outdir), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai)
     output:
-      tuple val(pool), val(bam), val(barcodes), val(donor_vcf), val(qc_rds), val(outdir), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path('donor.norm.bi.snp.vcf.gz')
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path('donor.norm.bi.snp.vcf.gz')
     script:
     """
     bcftools +fixref ${donor_vcf} -- -f ${ref_fasta} -m flip \\
@@ -65,85 +66,100 @@ process NORMALIZE_DONOR {
 process INTERSECT_SITES {
     tag { "intersect_${pool}" }
     input:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(donor_norm)
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(donor_norm)
     output:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path('sites.intersect.vcf.gz'), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(donor_norm)
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path('sites.intersect.vcf.gz'), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(donor_norm)
     script:
     """
-    # Ensure index for population VCF is available
-    if [ -f ${pop_vcf_index} ]; then ln -sf ${pop_vcf_index} $(basename ${pop_vcf_index}); fi
-    if [ -f ${pop_vcf}.csi ]; then ln -sf ${pop_vcf}.csi .; fi
+    # Ensure donor VCF is indexed
+    bcftools index -f ${donor_norm}
     bcftools isec -n=2 -w1 ${pop_vcf} ${donor_norm} -Oz -o sites.intersect.vcf.gz
-    tabix -f -p vcf sites.intersect.vcf.gz
+    bcftools index -f sites.intersect.vcf.gz
     """
 }
 
 process REHEADER_SITES {
     tag { "reheader_${pool}" }
     input:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_vcf), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(donor_norm)
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_vcf), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(donor_norm)
     output:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path('sites.intersect.bamorder.vcf.gz'), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(donor_norm)
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path('sites.intersect.bamorder.vcf.gz'), path('sites.intersect.bamorder.vcf.gz.tbi'), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(donor_norm)
     script:
     """
-    bcftools view --fasta-ref ${ref_fasta} ${sites_vcf} -Oz -o sites.intersect.bamorder.vcf.gz
-    tabix -f -p vcf sites.intersect.bamorder.vcf.gz
+    if [ ! -f "${ref_fai}" ]; then
+      echo "[ERROR] Missing FAI index for reference: ${ref_fai}" >&2
+      exit 1
+    fi
+    # Build fresh contig header lines in the exact FASTA (and BAM) order
+    awk 'BEGIN{OFS=""} {printf("##contig=<ID=%s,length=%s>\\n",\$1,\$2)}' ${ref_fai} > contigs.txt
+    # Strip existing contig lines from header
+    bcftools view -h ${sites_vcf} | grep -v '^##contig=' > header.no_contig.txt
+    # Insert contigs before the #CHROM line
+    awk 'NR==FNR{c[++n]=\$0;next} /^#CHROM/{for(i=1;i<=n;i++) print c[i]} {print}' contigs.txt header.no_contig.txt > header.with_contig.txt
+    # Reheader and convert back to bgzipped VCF
+    bcftools reheader -h header.with_contig.txt ${sites_vcf} -o sites.intersect.bamorder.bcf
+    bcftools view -Oz -o sites.intersect.bamorder.vcf.gz sites.intersect.bamorder.bcf
+    bcftools index -t -f sites.intersect.bamorder.vcf.gz
     """
 }
 
 process HARMONIZE_DONOR {
     tag { "harmonize_${pool}" }
     input:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(donor_norm)
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(sites_bamorder_idx), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(donor_norm)
     output:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path('donor.harmonized.to_sites.vcf.gz')
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(sites_bamorder_idx), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path('donor.harmonized.to_sites.vcf.gz')
     script:
     """
+    # Ensure donor VCF is indexed
+    bcftools index -f ${donor_norm}
+    # Ensure sites VCF is indexed
+    bcftools index -f ${sites_bamorder}
     bcftools isec -c all -n=2 -w1 ${donor_norm} ${sites_bamorder} -Oz -o donor.harmonized.to_sites.vcf.gz
-    tabix -f -p vcf donor.harmonized.to_sites.vcf.gz
+    bcftools index -f donor.harmonized.to_sites.vcf.gz
     """
 }
 
 process PILEUP {
     tag { "pileup_${pool}" }
     input:
-      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(harmonized_donor)
+      tuple val(pool), val(bam), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(sites_bamorder_idx), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(harmonized_donor)
     output:
-      tuple val(pool), val(barcodes), val(qc_rds), val(outdir), val(sites_bamorder), val(pop_vcf), val(pop_vcf_index), val(ref_fasta), val(harmonized_donor), path('pileup_prefix.txt')
+      tuple val(pool), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(sites_bamorder_idx), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(harmonized_donor), path('pileup_prefix.txt')
     script:
     """
-    export OMP_NUM_THREADS=40
+    export OMP_NUM_THREADS=60
     prefix="${outdir}/${pool}_pileup_intersect"
     /bin/bash ${params.pileup_script} \
       --sam ${bam} \
       --barcodes ${barcodes} \
       --vcf ${sites_bamorder} \
-      --out ${prefix}
-    echo ${prefix} > pileup_prefix.txt
+      --out \$prefix
+    echo \$prefix > pileup_prefix.txt
     """
 }
 
 process DEMUXLET {
     tag { "demux_${pool}" }
     input:
-      tuple val(pool), val(barcodes), val(qc_rds), val(outdir), val(sites_bamorder), val(pop_vcf), val(pop_vcf_index), val(ref_fasta), val(harmonized_donor), path(pileup_prefix_file)
+      tuple val(pool), val(barcodes), val(qc_rds), val(outdir), path(sites_bamorder), path(sites_bamorder_idx), path(pop_vcf), path(pop_vcf_index), path(ref_fasta), path(ref_fai), path(harmonized_donor), path(pileup_prefix_file)
     output:
       tuple val(pool), val(qc_rds), val(outdir), path('demuxlet_err015.best')
     script:
     """
-    export OMP_NUM_THREADS=40
+    export OMP_NUM_THREADS=60
     PLP=\$(cat ${pileup_prefix_file})
-    OUTDIR=${outdir}/demuxlet
-    mkdir -p ${OUTDIR}
+    OUTDIR="${outdir}/demuxlet"
+    mkdir -p "\$OUTDIR"
     /bin/bash ${params.demux_script} \
-      --plp ${PLP} \
+      --plp \$PLP \
       --vcf ${harmonized_donor} \
       --barcodes ${barcodes} \
-      --outdir ${OUTDIR} \
+      --outdir "\$OUTDIR" \
       --errs ${params.geno_error_offset} \
       --doublet-prior ${params.doublet_prior} \
       --alpha-list ${params.alphas}
-    ln -sf ${OUTDIR}/demuxlet_err${params.geno_error_offset}.best demuxlet_err015.best
+    ln -sf "\$OUTDIR"/demuxlet_err${params.geno_error_offset}.best demuxlet_err015.best
     """
 }
 

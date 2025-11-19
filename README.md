@@ -22,26 +22,34 @@ Global defaults (main.nf)
 
 Pipeline steps (per pool)
 -------------------------
-1) Normalize pop VCF (MAF≥0.05, biallelic SNVs)  
-2) Normalize donor VCF (bcftools +fixref/norm, biallelic SNVs)  
-3) Intersect pop/donor → `sites.intersect.vcf.gz`  
-4) Reheader to BAM order → `sites.intersect.bamorder.vcf.gz`  
-5) Harmonize donor to sites → `donor.harmonized.to_sites.vcf.gz`  
-6) Pileup: `scripts/01_run_pileup_1000G.sh` (CB/UB, MQ20, BQ13, cap BQ40)  
-7) Demuxlet: `scripts/02_run_demuxlet_sweep.sh` (alpha 0/0.5, prior 0.05, ERR 0.15) using the barcode whitelist  
-8) QC ∩ demux intersection: `scripts/qc_intersect.R` → `<pool>_final_labels.tsv` copied to outdir  
+1. **Normalize donor VCF** – `bcftools +fixref|norm|view` vs `genome.fa` → `donor.norm.bi.snp.vcf.gz` (bgzip + tabix).  
+2. **Intersect sites** – index donor VCF, `bcftools isec -n=2 -w1` against the population panel to get `sites.intersect.vcf.gz`.  
+3. **Reheader to BAM/FASTA order** – rebuild contig header from `genome.fa.fai`, reheader/interconvert (BCF→VCF.gz) and index → `sites.intersect.bamorder.vcf.gz`.  
+4. **Harmonize donor variants** – index donor/sites VCFs, `bcftools isec -c all -n=2 -w1` → `donor.harmonized.to_sites.vcf.gz` (indexed).  
+5. **Pileup** – `scripts/01_run_pileup_1000G.sh` (popscle dsc-pileup, `OMP_NUM_THREADS=60`, CB/UB tags) produces pileup matrices and `pileup_prefix.txt`.  
+6. **Demuxlet** – `scripts/02_run_demuxlet_sweep.sh` using the harmonized donor VCF + pileup prefix (`alpha 0/0.5`, `doublet-prior 0.05`, `geno-error-offset 0.15`) and writes `demuxlet_err015.best`.  
+7. **QC intersection** – `scripts/qc_intersect.R` merges Seurat QC labels with demux calls to create `<pool>_final_labels.tsv` and copies it to the pool outdir.  
+8. **Reporting** – `scripts/report_counts.R` summarises singlet/doublet counts into `<pool>_summary.tsv/.png`, again copied to the outdir.
 
 Containers
 ----------
 - QC_INTERSECT runs in `ghcr.io/johnsonlab-ic/sc_analysis:latest` (set in `nextflow.config`, docker enabled for local profile).  
 - Pileup/demuxlet call their own Docker images inside the bash scripts (`parisa/demux:2.1`).
 
-How to run
-----------
+How to run (current production command)
+---------------------------------------
+The runs that are executing successfully use a scratch temp/work directory on `/home/pr422/RDS/ephemeral/parisa_tmp` and rely on Docker (local profile):
+
 ```bash
 cd /home/pr422/RDS/live/Users/Parisa/demux-qc-flow
-nextflow run main.nf -profile local   --pools_csv pools.csv   # local profile (Docker on)
-# or
-nextflow run main.nf -profile standard --pools_csv pools.csv   # alias of local
+NXF_TEMP=/home/pr422/RDS/ephemeral/parisa_tmp/tmp \
+nextflow run main.nf -profile local \
+  --pools_csv /home/pr422/RDS/live/Users/Parisa/demux-qc-flow/pools.csv \
+  -work-dir /home/pr422/RDS/ephemeral/parisa_tmp/work
 ```
-Outputs per pool land in the `outdir` from `pools.csv` (e.g., `/home/pr422/RDS/live/Users/Parisa/EPILEP/diseased/demuxlet_results/<POOL>`), including `<pool>_final_labels.tsv`.
+
+Key notes:
+- Always include `-resume` when restarting a run; all intermediate steps are cache-aware.
+- The `pools.csv` shipped here has S3B commented/removed (no donor VCF available). Adjust as needed but keep the column order.
+- Ensure `genome.fa.fai` is present alongside the FASTA (required by REHEADER_SITES).
+- Outputs for each pool are written to the `outdir` path defined in `pools.csv` (e.g. `/home/pr422/RDS/live/Users/Parisa/EPILEP/demuxlet_results/S1A/`), containing pileup, demuxlet, `<pool>_final_labels.tsv`, and `<pool>_summary.{tsv,png}`.

@@ -80,13 +80,22 @@ fi
 
 mkdir -p "$(dirname "$OUT_PREFIX")"
 
+# Copy VCF and index into the out directory to avoid symlink issues on some filesystems
+VCF_BASENAME=$(basename "$VCF")
+VCF_LOCAL="$(dirname "$OUT_PREFIX")/${VCF_BASENAME}"
+if [[ "$VCF_LOCAL" != "$VCF" ]]; then
+  cp -f "$VCF" "$VCF_LOCAL"
+  if [[ -f "$VCF.tbi" ]]; then cp -f "$VCF.tbi" "$VCF_LOCAL.tbi"; fi
+  if [[ -f "$VCF.csi" ]]; then cp -f "$VCF.csi" "$VCF_LOCAL.csi"; fi
+fi
+
 echo "[INFO] Running dsc-pileup with population VCF: $VCF"
 # shellcheck disable=SC2086
 docker run --rm -u "$(id -u)":"$(id -g)" \
   -v "$HOST_ROOT":"$HOST_ROOT" \
   --entrypoint /opt/conda/bin/popscle "$IMAGE" dsc-pileup \
     --sam "$SAM" \
-    --vcf "$VCF" \
+    --vcf "$VCF_LOCAL" \
     --group-list "$BARCODES" \
     --tag-group "$TAG_GROUP" \
     --tag-UMI "$TAG_UMI" \
